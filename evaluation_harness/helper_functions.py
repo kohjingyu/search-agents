@@ -5,7 +5,6 @@ from typing import Any, Union
 from urllib.parse import urlparse
 
 import requests
-from beartype import beartype
 from beartype.typing import Dict, List
 from playwright.sync_api import CDPSession, Page
 
@@ -33,7 +32,6 @@ class PseudoPage:
             return getattr(self, attr)
 
 
-@beartype
 def shopping_get_auth_token() -> str:
     response = requests.post(
         url=f"{SHOPPING}/rest/default/V1/integration/admin/token",
@@ -49,7 +47,6 @@ def shopping_get_auth_token() -> str:
     return token
 
 
-@beartype
 def shopping_get_latest_order_url() -> str:
     """Get the latest order url from the shopping website."""
 
@@ -74,7 +71,6 @@ def shopping_get_latest_order_url() -> str:
     return order_url
 
 
-@beartype
 def shopping_get_sku_latest_review_author(sku: str) -> str:
     """Get the latest review for shopping admin."""
     header = {
@@ -92,7 +88,6 @@ def shopping_get_sku_latest_review_author(sku: str) -> str:
     return author
 
 
-@beartype
 def shopping_get_sku_latest_review_rating(sku: str) -> str:
     """Get the latest review for shopping admin."""
     header = {
@@ -111,7 +106,6 @@ def shopping_get_sku_latest_review_rating(sku: str) -> str:
     return rating
 
 
-@beartype
 def shopping_get_sku_latest_review_text(sku: str) -> str:
     """Get the latest review text for shopping admin."""
     header = {
@@ -129,7 +123,6 @@ def shopping_get_sku_latest_review_text(sku: str) -> str:
     return text
 
 
-@beartype
 def shopping_get_sku_latest_review_title(sku: str) -> str:
     """Get the latest review title for shopping admin."""
     header = {
@@ -147,7 +140,6 @@ def shopping_get_sku_latest_review_title(sku: str) -> str:
     return title
 
 
-@beartype
 def shopping_get_sku_product_page_url(sku: str) -> str:
     """Get product page url from sku"""
     header = {
@@ -167,7 +159,6 @@ def shopping_get_sku_product_page_url(sku: str) -> str:
     return ""
 
 
-@beartype
 def shopping_get_all_product_order(
     page: Page | PseudoPage,
 ) -> List[Dict[str, str]]:
@@ -234,7 +225,6 @@ def shopping_get_all_product_order(
     return result
 
 
-@beartype
 def shopping_get_order_product_name_list(page: Page | PseudoPage) -> str:
     try:
         products = shopping_get_all_product_order(page)
@@ -244,7 +234,6 @@ def shopping_get_order_product_name_list(page: Page | PseudoPage) -> str:
         return ""
 
 
-@beartype
 def shopping_get_order_product_quantity(
     page: Page | PseudoPage, sku: str
 ) -> int:
@@ -264,7 +253,6 @@ def shopping_get_order_product_quantity(
         return 0
 
 
-@beartype
 def shopping_get_order_product_option(
     page: Page | PseudoPage, sku: str, option_name: str
 ) -> str:
@@ -279,7 +267,6 @@ def shopping_get_order_product_option(
         return ""
 
 
-@beartype
 def shopping_get_product_attributes(
     page: Page | PseudoPage, attribute: str
 ) -> str:
@@ -316,7 +303,6 @@ def shopping_get_product_attributes(
     return result
 
 
-@beartype
 def shopping_get_product_price(page: Page | PseudoPage) -> Union[float, int]:
     """Get the price of the product on the shopping website."""
     try:
@@ -335,7 +321,6 @@ def shopping_get_product_price(page: Page | PseudoPage) -> Union[float, int]:
     return result
 
 
-@beartype
 def shopping_get_num_reviews(page: Page | PseudoPage) -> int:
     """Get the price of the product on the shopping website."""
     try:
@@ -354,7 +339,6 @@ def shopping_get_num_reviews(page: Page | PseudoPage) -> int:
     return result
 
 
-@beartype
 def shopping_get_rating_as_percentage(page: Page | PseudoPage) -> int:
     """Get the rating of the product on the shopping website as a percentage out of 100."""
     try:
@@ -372,7 +356,6 @@ def shopping_get_rating_as_percentage(page: Page | PseudoPage) -> int:
     return rating
 
 
-@beartype
 def get_query_text(page: Page | PseudoPage, selector: str) -> str:
     """Get the text content of the element matching the given selector.
 
@@ -396,13 +379,11 @@ def get_query_text(page: Page | PseudoPage, selector: str) -> str:
     return result
 
 
-@beartype
 def get_query_text_lowercase(page: Page | PseudoPage, selector: str) -> str:
     """Get the lowercase text content of the element matching the given selector."""
     return get_query_text(page, selector).lower()
 
 
-@beartype
 def reddit_get_post_url(url: str) -> str:
     """Get the post url"""
     # Url is http://domain/f/subreddit/post_id/...
@@ -421,7 +402,6 @@ def reddit_get_post_url(url: str) -> str:
     return post_url
 
 
-@beartype
 def reddit_get_post_comment_tree(page: Page | PseudoPage) -> Dict[str, Any]:
     try:
         comment_tree = page.evaluate(
@@ -448,7 +428,6 @@ def reddit_get_post_comment_tree(page: Page | PseudoPage) -> Dict[str, Any]:
     return comment_tree
 
 
-@beartype
 def reddit_get_latest_comment_obj_by_username(
     page: Page | PseudoPage, username: str
 ) -> Dict[str, Any]:
@@ -480,7 +459,6 @@ def reddit_get_latest_comment_obj_by_username(
     return comment
 
 
-@beartype
 def reddit_get_latest_comment_content_by_username(
     page: Page | PseudoPage, username: str
 ) -> str:
@@ -494,7 +472,6 @@ def reddit_get_latest_comment_content_by_username(
     return content
 
 
-@beartype
 def reddit_get_parent_comment_obj_of_latest_comment_by_username(
     page: Page | PseudoPage, username: str
 ) -> Dict[str, Any]:
@@ -526,7 +503,6 @@ def reddit_get_parent_comment_obj_of_latest_comment_by_username(
     return comment
 
 
-@beartype
 def reddit_get_parent_comment_username_of_latest_comment_by_username(
     page: Page | PseudoPage, username: str
 ) -> str:
@@ -542,7 +518,6 @@ def reddit_get_parent_comment_username_of_latest_comment_by_username(
     return username
 
 
-@beartype
 def gitlab_get_project_memeber_role(
     page: Page | PseudoPage, account_name: str
 ) -> str:
@@ -576,7 +551,6 @@ def gitlab_get_project_memeber_role(
     return role
 
 
-@beartype
 def llm_fuzzy_match(pred: str, reference: str, question: str) -> float:
     """Check whether the prediction matches the reference with GPT-4-turbo"""
     messages: list[dict[str, Any]] = []

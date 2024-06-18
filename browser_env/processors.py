@@ -1,5 +1,6 @@
 import json
-import pkgutil
+import os
+import time
 import re
 from collections import defaultdict
 from dataclasses import dataclass
@@ -11,7 +12,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
-import playwright
 import requests
 from gymnasium import spaces
 from PIL import Image, ImageDraw, ImageFont
@@ -21,11 +21,7 @@ from browser_env.constants import (
     ASCII_CHARSET,
     FREQ_UNICODE_CHARSET,
     IGNORED_ACTREE_PROPERTIES,
-    INJECTED_ATTR_NAME,
     UTTERANCE_MAX_LENGTH,
-    BID_ATTR,
-    DATA_REGEXP,
-    IN_VIEWPORT_RATIO_THRESHOLD,
 )
 
 from .utils import (
@@ -39,6 +35,8 @@ from .utils import (
     png_bytes_to_numpy,
 )
 
+IN_VIEWPORT_RATIO_THRESHOLD = 0.6
+
 
 def remove_unicode(input_string):
     # Define a regex pattern to match Unicode characters
@@ -51,7 +49,7 @@ def remove_unicode(input_string):
 
 
 class ObservationProcessor:
-    def process(self, page: Page) -> Observation:
+    def process(self, page: Page, client: CDPSession) -> Observation:
         raise NotImplementedError
 
 
@@ -63,21 +61,6 @@ def create_empty_metadata() -> ObservationMetadata:
     return {
         "obs_nodes_info": {},
     }
-
-
-def extract_data_items_from_aria(string: str) -> tuple[list[str], str]:
-    """
-    Utility function to extract temporary data stored in the "aria-roledescription" attribute of a node
-    """
-
-    match = DATA_REGEXP.fullmatch(string)
-    if not match:
-        return [], string
-
-    groups = match.groups()
-    data_items = groups[:-1]
-    original_aria = groups[-1]
-    return data_items, original_aria
 
 
 class TextObervationProcessor(ObservationProcessor):
@@ -96,20 +79,20 @@ class TextObervationProcessor(ObservationProcessor):
             create_empty_metadata()
         )  # use the store meta data of this observation type
 
+        # Cache captions.
+        self.url2caption = {}
         if self.observation_type in [
             "accessibility_tree_with_captioner",
             "image_som",
         ]:
             self.captioning_fn = captioning_fn
-            # Cache captions.
-            self.url2caption = {}
 
     def fetch_browser_info(
         self,
         page: Page,
+        client: CDPSession,
     ) -> BrowserInfo:
         # extract domtree
-        client = page.context.new_cdp_session(page)
         tree = client.send(
             "DOMSnapshot.captureSnapshot",
             {
@@ -118,7 +101,6 @@ class TextObervationProcessor(ObservationProcessor):
                 "includePaintOrder": True,
             },
         )
-        client.detach()
 
         # calibrate the bounds, in some cases, the bounds are scaled somehow
         bounds = tree["documents"][0]["layout"]["bounds"]
@@ -126,21 +108,19 @@ class TextObervationProcessor(ObservationProcessor):
         n = b[2] / self.viewport_size["width"]
         bounds = [[x / n for x in bound] for bound in bounds]
         tree["documents"][0]["layout"]["bounds"] = bounds
-        # add union bound placeholder
-        tree["documents"][0]["layout"]["unionBounds"] = [None for _ in bounds]
 
         # extract browser info
-        win_upper_bound = page.evaluate("window.pageYOffset")
+        win_top_bound = page.evaluate("window.pageYOffset")
         win_left_bound = page.evaluate("window.pageXOffset")
         win_width = page.evaluate("window.screen.width")
         win_height = page.evaluate("window.screen.height")
         win_right_bound = win_left_bound + win_width
-        win_lower_bound = win_upper_bound + win_height
+        win_lower_bound = win_top_bound + win_height
         device_pixel_ratio = page.evaluate("window.devicePixelRatio")
         assert device_pixel_ratio == 1.0, "devicePixelRatio is not 1.0"
 
         config: BrowserConfig = {
-            "win_upper_bound": win_upper_bound,
+            "win_top_bound": win_top_bound,
             "win_left_bound": win_left_bound,
             "win_width": win_width,
             "win_height": win_height,
@@ -153,7 +133,7 @@ class TextObervationProcessor(ObservationProcessor):
         info: BrowserInfo = {"DOMTree": tree, "config": config}
 
         return info
-    
+
     @staticmethod
     def get_bounding_client_rect(
         client: CDPSession, backend_node_id: str
@@ -211,7 +191,8 @@ class TextObervationProcessor(ObservationProcessor):
         )
         overlap_height = max(
             0,
-            min(elem_lower_bound, win_lower_bound) - max(elem_top_bound, win_top_bound),
+            min(elem_lower_bound, win_lower_bound)
+            - max(elem_top_bound, win_top_bound),
         )
 
         # Compute the overlap area
@@ -222,6 +203,7 @@ class TextObervationProcessor(ObservationProcessor):
         self,
         info: BrowserInfo,
         page: Page,
+        client: CDPSession,
         current_viewport_only: bool,
     ) -> DOMTree:
         # adopted from [natbot](https://github.com/nat/natbot)
@@ -233,7 +215,6 @@ class TextObervationProcessor(ObservationProcessor):
         # make a dom tree that is easier to navigate
         dom_tree: DOMTree = []
         graph = defaultdict(list)
-        client = page.context.new_cdp_session(page)
         for node_idx in range(len(nodes["nodeName"])):
             cur_node: DOMNode = {
                 "nodeId": "",
@@ -260,7 +241,9 @@ class TextObervationProcessor(ObservationProcessor):
             if node_value_idx >= 0 and node_value_idx < len(strings):
                 node_value = " ".join(strings[node_value_idx].split())
 
-            node_attributes = [strings[i] for i in nodes["attributes"][node_idx]]
+            node_attributes = [
+                strings[i] for i in nodes["attributes"][node_idx]
+            ]
             node_attributes_str = ""
             for i in range(0, len(node_attributes), 2):
                 a = node_attributes[i]
@@ -298,7 +281,6 @@ class TextObervationProcessor(ObservationProcessor):
 
             dom_tree.append(cur_node)
 
-        client.detach()
         # add parent children index to the node
         for parent_id, child_ids in graph.items():
             dom_tree[int(parent_id)]["childIds"] = child_ids
@@ -320,7 +302,9 @@ class TextObervationProcessor(ObservationProcessor):
 
                 # Insert children_nodeids in the same location
                 for child_id in child_ids:
-                    dom_tree[int(parent_id)]["childIds"].insert(index, child_id)
+                    dom_tree[int(parent_id)]["childIds"].insert(
+                        index, child_id
+                    )
                     index += 1
 
                 # update children node's parent
@@ -354,7 +338,9 @@ class TextObervationProcessor(ObservationProcessor):
                     remove_node_in_graph(node)
 
             dom_tree = [
-                node for node in dom_tree if node.get("parentId", "-1") != "[REMOVED]"
+                node
+                for node in dom_tree
+                if node.get("parentId", "-1") != "[REMOVED]"
             ]
 
         return dom_tree
@@ -364,7 +350,9 @@ class TextObervationProcessor(ObservationProcessor):
         """Parse the html tree into a string text"""
 
         obs_nodes_info = {}
-        nodeid_to_cursor = {node["nodeId"]: idx for idx, node in enumerate(dom_tree)}
+        nodeid_to_cursor = {
+            node["nodeId"]: idx for idx, node in enumerate(dom_tree)
+        }
 
         def dfs(node_cursor: int, depth: int) -> str:
             tree_str = ""
@@ -402,11 +390,10 @@ class TextObervationProcessor(ObservationProcessor):
 
     def fetch_page_accessibility_tree(
         self,
-        page: Page,
         info: BrowserInfo,
+        client: CDPSession,
         current_viewport_only: bool,
     ) -> AccessibilityTree:
-        client = page.context.new_cdp_session(page)
         accessibility_tree: AccessibilityTree = client.send(
             "Accessibility.getFullAXTree", {}
         )["nodes"]
@@ -433,8 +420,7 @@ class TextObervationProcessor(ObservationProcessor):
                 node["union_bound"] = [0.0, 0.0, 10.0, 10.0]
             else:
                 response = self.get_bounding_client_rect(
-                    client,
-                    backend_node_id
+                    client, backend_node_id
                 )
                 if response.get("result", {}).get("subtype", "") == "error":
                     node["union_bound"] = None
@@ -445,7 +431,6 @@ class TextObervationProcessor(ObservationProcessor):
                     height = response["result"]["value"]["height"]
                     node["union_bound"] = [x, y, width, height]
 
-        client.detach()
         # filter nodes that are not in the current viewport
         if current_viewport_only:
 
@@ -462,7 +447,9 @@ class TextObervationProcessor(ObservationProcessor):
                     is not None
                 )
                 # remove the nodeid from parent's childIds
-                index = accessibility_tree[parent_cursor]["childIds"].index(nodeid)
+                index = accessibility_tree[parent_cursor]["childIds"].index(
+                    nodeid
+                )
                 accessibility_tree[parent_cursor]["childIds"].pop(index)
                 # Insert children_nodeids in the same location
                 for child_nodeid in children_nodeids:
@@ -473,7 +460,9 @@ class TextObervationProcessor(ObservationProcessor):
                 # update children node's parent
                 for child_nodeid in children_nodeids:
                     child_cursor = nodeid_to_cursor[child_nodeid]
-                    accessibility_tree[child_cursor]["parentId"] = parent_nodeid
+                    accessibility_tree[child_cursor][
+                        "parentId"
+                    ] = parent_nodeid
                 # mark as removed
                 accessibility_tree[node_cursor]["parentId"] = "[REMOVED]"
 
@@ -610,7 +599,8 @@ class TextObervationProcessor(ObservationProcessor):
                 if match:
                     static_text = match.group(1)[1:-1]  # remove the quotes
                     if static_text and all(
-                        static_text not in prev_line for prev_line in prev_lines
+                        static_text not in prev_line
+                        for prev_line in prev_lines
                     ):
                         clean_lines.append(line)
             else:
@@ -618,110 +608,7 @@ class TextObervationProcessor(ObservationProcessor):
 
         return "\n".join(clean_lines)
 
-    def fetch_image_related(self, page: Page, browser_info: BrowserInfo) -> str:
-        # Check if the current page is an image url
-        if page.url.endswith((".jpg", ".jpeg", ".png")):
-            print("NOTE: We are on an image page!!!")
-            # Load image from current url and run captioning on it.
-            if page.url not in self.url2caption and self.captioning_fn is not None:
-                try:
-                    image = Image.open(requests.get(page.url, stream=True).raw)
-                    caption = self.captioning_fn([image])[0].strip()
-                    self.url2caption[page.url] = remove_unicode(caption)
-                except Exception as e:
-                    print("L579 WARNING: ", e)
-            content = self.url2caption.get(page.url, "Image")
-
-        else:
-            if self.captioning_fn is not None:
-                images = page.query_selector_all("img")
-                image_urls = []
-                for image in images:
-                    try:
-                        image_url = image.get_attribute("src")
-                        if not image_url.startswith(("http://", "https://", "www.")):
-                            image_url = urljoin(page.url, image_url)
-                        if image_url not in self.url2caption:
-                            image_urls.append(image_url)
-                    except Exception as e:
-                        print("L604 WARNING: ", e)
-
-                # Run image captioning on image_url pixels. This is for models which use captioning as a baseline.
-                if len(image_urls) > 0:
-                    image_pixels = []
-                    valid_urls = []
-                    for url in image_urls:
-                        if "data:image/svg" in url:
-                            continue
-                        else:
-                            try:
-                                image = Image.open(requests.get(url, stream=True).raw)
-                                image_pixels.append(image)
-                                valid_urls.append(url)
-                            except Exception as e:
-                                print("L616 WARNING: ", e)
-
-                    # Caption images.
-                    if image_pixels:
-                        # Run in batches of 4.
-                        bs = 4
-                        captions = []
-                        for i in range(0, len(image_pixels), bs):
-                            try:
-                                captions.extend(
-                                    self.captioning_fn(image_pixels[i : i + bs])
-                                )
-                            except Exception as e:
-                                print("L628 WARNING: ", e)
-                                captions.extend([""] * len(image_pixels[i : i + bs]))
-                        assert len(valid_urls) == len(
-                            captions
-                        ), f"len(images)={len(valid_urls)}, len(captions)={len(captions)}"
-                        for image_url, caption in zip(valid_urls, captions):
-                            self.url2caption[image_url] = remove_unicode(
-                                caption.strip()
-                            )
-
-                image_idx = 0
-                for image in images:
-                    try:
-                        original_alt = image.get_attribute("alt") or ""
-                        image_url = image.get_attribute("src")
-                        if not image_url.startswith(("http://", "https://", "www.")):
-                            image_url = urljoin(page.url, image_url)
-
-                        updated_alt = original_alt
-
-                        if image_url in self.url2caption:
-                            if self.url2caption[image_url] not in updated_alt:
-                                updated_alt = f"{updated_alt}, description: {self.url2caption[image_url]}"
-                        elif "data:image/svg" not in image_url:
-                            print(f"WARNING: {image_url} not in self.url2caption")
-
-                        if "url:" not in updated_alt:
-                            updated_alt = f"{updated_alt}, url: {image_url}"
-
-                        safe_updated_alt = json.dumps(updated_alt)
-                        image.evaluate(f"node => node.alt = {safe_updated_alt}")
-                    except Exception as e:
-                        print("L653 WARNING:", e)
-
-            if self.observation_type == "accessibility_tree_with_captioner":
-                frame_ax_trees = self.fetch_page_accessibility_tree(
-                    page,
-                    browser_info,
-                    current_viewport_only=self.current_viewport_only
-                )
-                content, obs_nodes_info = self.parse_accessibility_tree(frame_ax_trees)
-                content = self.clean_accesibility_tree(content)
-                self.obs_nodes_info = obs_nodes_info
-                self.meta_data["obs_nodes_info"] = obs_nodes_info
-            else:
-                content = ""  # Not used for SoM
-
-        return content
-
-    def process(self, page: Page) -> str:
+    def process(self, page: Page, client: CDPSession) -> str:
         # get the tab info
         open_tabs = page.context.pages
         try:
@@ -729,24 +616,29 @@ class TextObervationProcessor(ObservationProcessor):
             current_tab_idx = open_tabs.index(page)
             for idx in range(len(open_tabs)):
                 if idx == current_tab_idx:
-                    tab_titles[idx] = f"Tab {idx} (current): {open_tabs[idx].title()}"
+                    tab_titles[
+                        idx
+                    ] = f"Tab {idx} (current): {open_tabs[idx].title()}"
                 else:
                     tab_titles[idx] = f"Tab {idx}: {open_tabs[idx].title()}"
             tab_title_str = " | ".join(tab_titles)
         except Exception:
-            tab_title_str = " | ".join([f"Tab {idx}" for idx in range(len(open_tabs))])
-
+            tab_title_str = " | ".join(
+                ["Tab {idx}" for idx in range(len(open_tabs))]
+            )
+        
         try:
-            browser_info = self.fetch_browser_info(page)
+            browser_info = self.fetch_browser_info(page, client)
         except Exception:
-            page.wait_for_load_state("load", timeout=500)
-            browser_info = self.fetch_browser_info(page)
+            page.wait_for_load_state("load", timeout=2500)
+            browser_info = self.fetch_browser_info(page, client)
 
         if self.observation_type == "html":
             dom_tree = self.fetch_page_html(
                 browser_info,
                 page,
-                self.current_viewport_only,
+                client,
+                current_viewport_only=self.current_viewport_only,
             )
             content, obs_nodes_info = self.parse_html(dom_tree)
             self.obs_nodes_info = obs_nodes_info
@@ -754,33 +646,172 @@ class TextObervationProcessor(ObservationProcessor):
 
         elif self.observation_type == "accessibility_tree":
             accessibility_tree = self.fetch_page_accessibility_tree(
-                page,
                 browser_info,
-                self.current_viewport_only,
+                client,
+                current_viewport_only=self.current_viewport_only,
             )
-            content, obs_nodes_info = self.parse_accessibility_tree(accessibility_tree)
+            content, obs_nodes_info = self.parse_accessibility_tree(
+                accessibility_tree
+            )
             content = self.clean_accesibility_tree(content)
             self.obs_nodes_info = obs_nodes_info
             self.meta_data["obs_nodes_info"] = obs_nodes_info
-
+        elif self.observation_type == "":
+            content = ""
         elif self.observation_type in [
             "accessibility_tree_with_captioner",
             "image_som",
         ]:
-            content = self.fetch_image_related(
-                page,
-                browser_info,
-            )
+            # Check if the current page is an image url
+            if page.url.endswith((".jpg", ".jpeg", ".png")):
+                # Load image from current url and run captioning on it.
+                if page.url not in self.url2caption and self.captioning_fn is not None:
+                    try:
+                        image = Image.open(
+                            requests.get(page.url, stream=True).raw
+                        )
+                        caption = self.captioning_fn([image])[0].strip()
+                        self.url2caption[page.url] = remove_unicode(caption)
+                    except Exception as e:
+                        print("WARNING: ", e)
 
-        elif self.observation_type == "":
-            content = ""
+                content = self.url2caption.get(page.url, "Image")
+            else:
+                if self.captioning_fn is not None:
+                    try:
+                        image_data = page.evaluate("""
+                            () => {
+                                const images = document.querySelectorAll('img');
+                                return Array.from(images).map(img => img.getAttribute('src') || '');
+                            }
+                        """)
+                    except Exception as e:
+                        print("Failed to fetch image sources: ", e)
+                        image_data = []
 
+                    image_urls = []
+                    for image_src in image_data:
+                        try:
+                            if not image_src.startswith(("http://", "https://", "www.")):
+                                image_src = urljoin(page.url, image_src)
+                            if image_src not in self.url2caption:
+                                image_urls.append(image_src)
+                        except Exception as e:
+                            print("WARNING:", e)
+
+                    # Run image captioning on image_url pixels. This is for models which use captioning as a baseline.
+                    if len(image_urls) > 0:
+                        image_pixels = []
+                        valid_urls = []
+                        for url in image_urls:
+                            if "data:image/svg" in url:
+                                continue
+                            else:
+                                try:
+                                    image = Image.open(
+                                        requests.get(url, stream=True).raw
+                                    )
+                                    image_pixels.append(image)
+                                    valid_urls.append(url)
+                                except Exception as e:
+                                    print("WARNING: ", e)
+
+                        # Caption images.
+                        if image_pixels:
+                            bs = 4
+                            captions = []
+                            for i in range(0, len(image_pixels), bs):
+                                try:
+                                    captions.extend(
+                                        self.captioning_fn(
+                                            image_pixels[i : i + bs]
+                                        )
+                                    )
+                                except Exception as e:
+                                    print("WARNING: ", e)
+                                    captions.extend(
+                                        [""] * len(image_pixels[i : i + bs])
+                                    )
+                            assert len(valid_urls) == len(
+                                captions
+                            ), f"len(images)={len(valid_urls)}, len(captions)={len(captions)}"
+                            for image_url, caption in zip(valid_urls, captions):
+                                self.url2caption[image_url] = remove_unicode(
+                                    caption.strip()
+                                )
+
+                    image_updates = []
+                    images_data = page.evaluate("""
+                        () => {
+                            const images = document.querySelectorAll('img');
+                            return Array.from(images).map(img => ({
+                                alt: img.getAttribute('alt') || '',
+                                src: img.getAttribute('src')
+                            }));
+                        }
+                    """)
+                    for image_data in images_data:
+                        try:
+                            updated_alt, image_url = image_data['alt'], image_data['src']
+                            if not image_url.startswith(("http://", "https://", "www.")):
+                                image_url = urljoin(page.url, image_url)
+                            if image_url in self.url2caption:
+                                if self.url2caption[image_url] not in updated_alt:
+                                    if updated_alt:
+                                        updated_alt = f"{updated_alt}, description: {self.url2caption[image_url]}"
+                                    else:
+                                        updated_alt = f"description: {self.url2caption[image_url]}"
+                            elif "data:image/svg" not in image_url:
+                                print(f"WARNING: {image_url} not in self.url2caption")
+
+                            if "url:" not in updated_alt:
+                                updated_alt = f"{updated_alt}, url: {image_url}"
+
+                            safe_updated_alt = json.dumps(updated_alt)
+                            image_updates.append({'image_url': image_url, 'updated_alt': safe_updated_alt})
+                        except Exception as e:
+                            print("WARNING:", e)
+
+                    # Execute the batch update
+                    js_code = """
+                        (image_updates => {
+                            const images = document.querySelectorAll('img');
+                            const urlToImageMap = {};
+                            images.forEach(img => {
+                                urlToImageMap[img.src] = img;
+                            });
+
+                            image_updates.forEach(update => {
+                                const img = urlToImageMap[update.image_url];
+                                if (img) {
+                                    img.alt = update.updated_alt;
+                                }
+                            });
+                        })(%s);
+                    """ % json.dumps(image_updates)
+                    page.evaluate(js_code)
+                if (
+                    self.observation_type
+                    == "accessibility_tree_with_captioner"
+                ):
+                    accessibility_tree = self.fetch_page_accessibility_tree(
+                        browser_info, client, current_viewport_only=self.current_viewport_only,
+                    )
+                    content, obs_nodes_info = self.parse_accessibility_tree(
+                        accessibility_tree
+                    )
+                    content = self.clean_accesibility_tree(content)
+                    self.obs_nodes_info = obs_nodes_info
+                    self.meta_data["obs_nodes_info"] = obs_nodes_info
+                else:
+                    content = ""  # Not used for SoM
         else:
-            raise ValueError(f"Invalid observation type: {self.observation_type}")
+            raise ValueError(
+                f"Invalid observation type: {self.observation_type}"
+            )
 
         self.browser_config = browser_info["config"]
         content = f"{tab_title_str}\n\n{content}"
-
         return content
 
     def get_element_center(self, element_id: str) -> tuple[float, float]:
@@ -814,8 +845,7 @@ class ImageObservationProcessor(ObservationProcessor):
                 'a[href]:not(:has(img))', 'a[href] img', 'button', 'input:not([type="hidden"])', 'textarea', 'select',
                 '[tabindex]:not([tabindex="-1"])', '[contenteditable="true"]', '[role="button"]', '[role="link"]',
                 '[role="checkbox"]', '[role="menuitem"]', '[role="tab"]', '[draggable="true"]',
-                '.btn', 'a[href="/notifications"]', 'a[href="/submit"]', '.fa.fa-star.is-rating-item', 'input[type="checkbox"]'
-
+                '.btn', 'option', 'a[href="/notifications"]', 'a[href="/submit"]', '.fa.fa-star.is-rating-item', 'input[type="checkbox"]'
             ];
 
             const textSelectors = ['p', 'span', 'div:not(:has(*))', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'article'];
@@ -916,6 +946,7 @@ class ImageObservationProcessor(ObservationProcessor):
         # Provide [id] textContent inputs to the model as text.
         text_content_elements = []
         text_content_text = set()  # Store text of interactable elements
+        id2semantic = {}
 
         # Iterate through each row in the CSV and draw bounding boxes
         for _, row in df.iterrows():
@@ -927,16 +958,23 @@ class ImageObservationProcessor(ObservationProcessor):
                 # Add HTML textContent (if any) to the text representation.
                 if pd.notna(row["TextContent"]):
                     content += (
-                        row["TextContent"].strip().replace("\n", "").replace("\t", "")
+                        row["TextContent"]
+                        .strip()
+                        .replace("\n", "")
+                        .replace("\t", "")
                     )[
                         :200
                     ]  # Limit to 200 characters to avoid having too much text
 
                 # Check if the text is a CSS selector
-                if content and not (content.startswith(".") and "{" in content):
+                if content and not (
+                    content.startswith(".") and "{" in content
+                ):
                     # Add elements which are not interactable as StaticText
                     if content not in text_content_text:
-                        text_content_elements.append(f"[] [StaticText] [{content}]")
+                        text_content_elements.append(
+                            f"[] [StaticText] [{content}]"
+                        )
                         text_content_text.add(content)
                 continue
 
@@ -944,9 +982,9 @@ class ImageObservationProcessor(ObservationProcessor):
                 continue
 
             unique_id = str(index + 1)
-            bbox_id2visid[row["ID"]] = (
-                unique_id  # map the bounding box ID to the unique character ID
-            )
+            bbox_id2visid[
+                row["ID"]
+            ] = unique_id  # map the bounding box ID to the unique character ID
             top, right, bottom, left, width, height = (
                 row["Top"],
                 row["Right"],
@@ -956,12 +994,7 @@ class ImageObservationProcessor(ObservationProcessor):
                 row["Height"],
             )
             left, right, top, bottom = left - b_x, right - b_x, top - b_y, bottom - b_y
-            id2center[unique_id] = (
-                (left + right) / 2,
-                (bottom + top) / 2,
-                width,
-                height,
-            )
+            id2center[unique_id] = ((left + right) / 2, (bottom + top) / 2, width, height)
 
             if width >= min_width and height >= min_height:
                 # Get the next color in the cycle
@@ -1026,12 +1059,16 @@ class ImageObservationProcessor(ObservationProcessor):
                             if (
                                 new_text_rectangle[0] >= 0
                                 and new_text_rectangle[1] >= 0
-                                and new_text_rectangle[2] <= viewport_size["width"]
-                                and new_text_rectangle[3] <= viewport_size["height"]
+                                and new_text_rectangle[2]
+                                <= viewport_size["width"]
+                                and new_text_rectangle[3]
+                                <= viewport_size["height"]
                             ):
                                 # If the rectangle is within the viewport, check for overlaps
                                 overlaps = False
-                                for existing_rectangle in existing_text_rectangles:
+                                for (
+                                    existing_rectangle
+                                ) in existing_text_rectangles:
                                     if self.rectangles_overlap(
                                         new_text_rectangle,
                                         existing_rectangle,
@@ -1078,6 +1115,7 @@ class ImageObservationProcessor(ObservationProcessor):
                     text_content_elements.append(
                         f"[{unique_id}] [{row['Element']}] [{content}]"
                     )
+                    id2semantic[unique_id] = f"[{row['Element']}] element with content [{content}]"
                     if content in text_content_text:
                         # Remove text_content_elements with content
                         text_content_elements = [
@@ -1095,7 +1133,7 @@ class ImageObservationProcessor(ObservationProcessor):
             draw.text(text_position, unique_id, font=font, fill="white")
 
         content_str = "\n".join(text_content_elements)
-        return img, id2center, content_str
+        return img, id2center, content_str, id2semantic
 
     def rectangles_overlap(self, rect1, rect2, padding):
         """
@@ -1109,12 +1147,12 @@ class ImageObservationProcessor(ObservationProcessor):
             or rect1[3] < rect2[1] + padding
         )
 
-    def process(self, page: Page) -> npt.NDArray[np.uint8]:
+    def process(self, page: Page, client: CDPSession) -> npt.NDArray[np.uint8]:
         try:
-            browser_info = self.fetch_browser_info(page)
+            browser_info = self.fetch_browser_info(page, client)
         except Exception:
-            page.wait_for_load_state("load", timeout=500)
-            browser_info = self.fetch_browser_info(page)
+            page.wait_for_load_state("load", timeout=2500)
+            browser_info = self.fetch_browser_info(page, client)
 
         self.browser_config = browser_info["config"]
 
@@ -1124,39 +1162,44 @@ class ImageObservationProcessor(ObservationProcessor):
                 screenshot_bytes = page.screenshot()
                 som_bboxes = self.get_page_bboxes(page)
                 screenshot_img = Image.open(BytesIO(screenshot_bytes))
-                bbox_img, id2center, content_str = self.draw_bounding_boxes(
+                bbox_img, id2center, content_str, id2semantic = self.draw_bounding_boxes(
                     som_bboxes,
                     screenshot_img,
                     viewport_size=self.viewport_size,
                 )
                 self.som_id_info = id2center
                 self.meta_data["obs_nodes_info"] = id2center
+                self.meta_data["obs_nodes_semantic_info"] = id2semantic
                 screenshot_som = np.array(bbox_img)
-                return screenshot_som, content_str
+                return screenshot_som, np.array(screenshot_img), content_str
             except:
                 page.wait_for_event("load")
                 screenshot_bytes = page.screenshot()
                 som_bboxes = self.get_page_bboxes(page)
                 screenshot_img = Image.open(BytesIO(screenshot_bytes))
-                bbox_img, id2center, content_str = self.draw_bounding_boxes(
+                bbox_img, id2center, content_str, id2semantic = self.draw_bounding_boxes(
                     som_bboxes,
                     screenshot_img,
                     viewport_size=self.viewport_size,
                 )
                 self.som_id_info = id2center
                 self.meta_data["obs_nodes_info"] = id2center
+                self.meta_data["obs_nodes_semantic_info"] = id2semantic
                 screenshot_som = np.array(bbox_img)
-                return screenshot_som, content_str
+                return screenshot_som, np.array(screenshot_img), content_str
         else:
             try:
                 screenshot = png_bytes_to_numpy(page.screenshot())
             except:
                 page.wait_for_event("load")
                 screenshot = png_bytes_to_numpy(page.screenshot())
-            return screenshot, ""
+            return screenshot, screenshot, ""
 
-    def fetch_browser_info(self, page: Page) -> BrowserInfo:
-        client = page.context.new_cdp_session(page)
+    def fetch_browser_info(
+        self,
+        page: Page,
+        client: CDPSession,
+    ) -> BrowserInfo:
         # extract domtree
         tree = client.send(
             "DOMSnapshot.captureSnapshot",
@@ -1166,7 +1209,7 @@ class ImageObservationProcessor(ObservationProcessor):
                 "includePaintOrder": True,
             },
         )
-        client.detach()
+
         # calibrate the bounds, in some cases, the bounds are scaled somehow
         bounds = tree["documents"][0]["layout"]["bounds"]
         b = bounds[0]
@@ -1262,12 +1305,14 @@ class ObservationHandler:
 
         return spaces.Dict({"text": text_space, "image": image_space})
 
-    def get_observation(self, page: Page) -> dict[str, Observation]:
-        text_obs = self.text_processor.process(page)
-        image_obs, content_str = self.image_processor.process(page)
+    def get_observation(
+        self, page: Page, client: CDPSession
+    ) -> dict[str, Observation]:
+        text_obs = self.text_processor.process(page, client)
+        image_obs, raw_screenshot_obs, content_str = self.image_processor.process(page, client)
         if content_str != "":
             text_obs = content_str
-        return {"text": text_obs, "image": image_obs}
+        return {"text": text_obs, "image": image_obs, "raw_screenshot": raw_screenshot_obs}
 
     def get_observation_metadata(self) -> dict[str, ObservationMetadata]:
         return {

@@ -13,6 +13,7 @@ from llms import (
     generate_from_openai_completion,
     lm_config,
 )
+from PIL import Image as PILImage
 
 APIInput = str | list[Any] | dict[str, Any]
 
@@ -20,6 +21,7 @@ APIInput = str | list[Any] | dict[str, Any]
 def call_llm(
     lm_config: lm_config.LMConfig,
     prompt: APIInput,
+    num_outputs: int = 1,
 ) -> str:
     response: str
     if lm_config.provider == "openai":
@@ -33,6 +35,7 @@ def call_llm(
                 context_length=lm_config.gen_config["context_length"],
                 max_tokens=lm_config.gen_config["max_tokens"],
                 stop_token=None,
+                num_outputs=num_outputs,
             )
         elif lm_config.mode == "completion":
             assert isinstance(prompt, str)
@@ -61,7 +64,7 @@ def call_llm(
     elif lm_config.provider == "google":
         assert isinstance(prompt, list)
         assert all(
-            [isinstance(p, str) or isinstance(p, Image) for p in prompt]
+            [isinstance(p, str) or isinstance(p, Image) or isinstance(p, PILImage.Image) for p in prompt]
         )
         response = generate_from_gemini_completion(
             prompt=prompt,
@@ -69,6 +72,7 @@ def call_llm(
             temperature=lm_config.gen_config["temperature"],
             max_tokens=lm_config.gen_config["max_tokens"],
             top_p=lm_config.gen_config["top_p"],
+            # n=1  # Gemini only supports 1 output for now
         )
     else:
         raise NotImplementedError(

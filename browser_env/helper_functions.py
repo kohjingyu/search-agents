@@ -5,6 +5,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from bs4 import BeautifulSoup
+
 from PIL import Image
 
 from agent.prompts import *
@@ -55,9 +57,9 @@ def get_render_action(
             action_str += f"<div class='parsed_action' style='background-color:yellow'><pre>{action2str(action, action_set_tag, node_content)}</pre></div>"
 
         case "som":
-            text_meta_data = observation_metadata["text"]
-            if action["element_id"] in text_meta_data["obs_nodes_info"]:
-                node_content = text_meta_data["obs_nodes_info"][
+            meta_data = observation_metadata["image"]
+            if action["element_id"] in meta_data["obs_nodes_semantic_info"]:
+                node_content = meta_data["obs_nodes_semantic_info"][
                     action["element_id"]
                 ]
             else:
@@ -117,21 +119,19 @@ def get_action_description(
                     action_str = action2str(action, action_set_tag, "")
 
         case "som":
-            text_meta_data = observation_metadata["image"]
+            meta_data = observation_metadata["image"]
             if action["action_type"] in [
                 ActionTypes.CLICK,
                 ActionTypes.HOVER,
                 ActionTypes.TYPE,
             ]:
                 action_name = str(action["action_type"]).split(".")[1].lower()
-                if action["element_id"] in text_meta_data["obs_nodes_info"]:
-                    action_str = action2str(action, action_set_tag, "")
+                if action["element_id"] in meta_data["obs_nodes_semantic_info"]:
+                    node_content = meta_data["obs_nodes_semantic_info"][
+                        action["element_id"]
+                    ]
+                    action_str = action2str(action, action_set_tag, node_content)
                 else:
-                    print(
-                        'action["element_id"], text_meta_data["obs_nodes_info"]',
-                        action["element_id"],
-                        text_meta_data["obs_nodes_info"],
-                    )
                     action_str = f"Attempt to perfom \"{action_name}\" on element \"[{action['element_id']}]\" but no matching element found. Please check the observation more carefully."
             else:
                 if (
@@ -158,7 +158,7 @@ class RenderHelper(object):
     """Helper class to render text and image observations and meta data in the trajectory"""
 
     def __init__(
-        self, config_file: str, result_dir: str, action_set_tag: str
+        self, config_file: str, result_dir: str, action_set_tag: str, prefix: str = ""
     ) -> None:
         with open(config_file, "r") as f:
             _config = json.load(f)
@@ -170,9 +170,14 @@ class RenderHelper(object):
 
         self.action_set_tag = action_set_tag
 
-        self.render_file = open(
-            Path(result_dir) / f"render_{task_id}.html", "a+", encoding="utf-8"
-        )
+        if prefix:
+            self.render_file = open(
+                Path(result_dir) / f"render_{prefix}_{task_id}.html", "a+", encoding="utf-8"
+            )
+        else:
+            self.render_file = open(
+                Path(result_dir) / f"render_{task_id}.html", "a+", encoding="utf-8"
+            )
         self.render_file.truncate(0)
         # write init template
         self.render_file.write(HTML_TEMPLATE.format(body=f"{_config_str}"))
@@ -185,6 +190,7 @@ class RenderHelper(object):
         state_info: StateInfo,
         meta_data: dict[str, Any],
         render_screenshot: bool = False,
+        additional_text: list[str] | None = None,
     ) -> None:
         """Render the trajectory"""
         # text observation
@@ -209,6 +215,16 @@ class RenderHelper(object):
         # meta data
         new_content += f"<div class='prev_action' style='background-color:pink'>{meta_data['action_history'][-1]}</div>\n"
 
+        # additional text
+        if additional_text:
+            for text_i, text in enumerate(additional_text):
+                # Alternate background color between light green and light blue
+                if text_i % 2 == 0:
+                    bg_color = "#87CEFA"
+                else:
+                    bg_color = "#98FB98"
+                new_content += f"<div class='additional_text' style='background-color: {bg_color}'>#{text_i+1}: {text}</div>\n"
+
         # action
         action_str = get_render_action(
             action,
@@ -222,8 +238,15 @@ class RenderHelper(object):
         # add new content
         self.render_file.seek(0)
         html = self.render_file.read()
-        html_body = re.findall(r"<body>(.*?)</body>", html, re.DOTALL)[0]
-        html_body += new_content
+        soup = BeautifulSoup(html, 'html.parser')
+        body_tag = soup.body
+
+        if body_tag:
+            html_body = str(body_tag)
+            html_body += new_content
+        else:
+            # Handle the case when <body> tag is not found
+            html_body = new_content
 
         html = HTML_TEMPLATE.format(body=html_body)
         self.render_file.seek(0)

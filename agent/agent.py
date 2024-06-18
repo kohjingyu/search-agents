@@ -1,4 +1,5 @@
 import argparse
+import re
 import json
 from typing import Any, Optional
 
@@ -107,7 +108,7 @@ class PromptAgent(Agent):
         action_set_tag: str,
         lm_config: lm_config.LMConfig,
         prompt_constructor: PromptConstructor,
-        captioning_fn = None,
+        captioning_fn = None
     ) -> None:
         super().__init__()
         self.lm_config = lm_config
@@ -116,7 +117,7 @@ class PromptAgent(Agent):
         self.captioning_fn = captioning_fn
 
         # Check if the model is multimodal.
-        if ("gemini" in lm_config.model or "gpt-4" in lm_config.model and "vision" in lm_config.model) and type(prompt_constructor) == MultimodalCoTPromptConstructor:
+        if ("gemini" in lm_config.model or "gpt-4" in lm_config.model and "vision" in lm_config.model or "gpt-4o" in lm_config.model) and type(prompt_constructor) == MultimodalCoTPromptConstructor:
             self.multimodal_inputs = True
         else:
             self.multimodal_inputs = False
@@ -127,8 +128,9 @@ class PromptAgent(Agent):
     @beartype
     def next_action(
         self, trajectory: Trajectory, intent: str, meta_data: dict[str, Any], images: Optional[list[Image.Image]] = None,
-        output_response: bool = False
+        output_response: bool = False, branching_factor: int = 1
     ) -> Action:
+        del branching_factor  # Not used in prompt agent.
         # Create page screenshot image for multimodal models.
         if self.multimodal_inputs:
             page_screenshot_arr = trajectory[-1]["observation"]["image"]
@@ -201,6 +203,137 @@ class PromptAgent(Agent):
         pass
 
 
+class SearchAgent(Agent):
+    """prompt-based agent with search that emits action given the history"""
+
+    def __init__(
+        self,
+        action_set_tag: str,
+        lm_config: lm_config.LMConfig,
+        prompt_constructor: PromptConstructor,
+        captioning_fn = None,
+    ) -> None:
+        super().__init__()
+        self.lm_config = lm_config
+        self.prompt_constructor = prompt_constructor
+        self.action_set_tag = action_set_tag
+        self.captioning_fn = captioning_fn
+
+        # Check if the model is multimodal.
+        if ("gemini" in lm_config.model or "gpt-4" in lm_config.model and "vision" in lm_config.model or "gpt-4o" in lm_config.model) and type(prompt_constructor) == MultimodalCoTPromptConstructor:
+            self.multimodal_inputs = True
+        else:
+            self.multimodal_inputs = False
+
+
+    def set_action_set_tag(self, tag: str) -> None:
+        self.action_set_tag = tag
+
+    def next_action(
+        self, trajectory: Trajectory, intent: str, meta_data: dict[str, Any], images: Optional[list[Image.Image]] = None,
+        output_response: bool = False, branching_factor: int = 5
+    ) -> list[Action]:
+        if output_response:
+            print("Using SearchAgent, branching_factor =", branching_factor)
+        # Create page screenshot image for multimodal models.
+        if self.multimodal_inputs:
+            page_screenshot_arr = trajectory[-1]["observation"]["image"]
+            page_screenshot_img = Image.fromarray(
+                page_screenshot_arr
+            )  # size = (viewport_width, viewport_width)
+
+        # Caption the input image, if provided.
+        if images is not None and len(images) > 0:
+            if self.captioning_fn is not None:
+                image_input_caption = ""
+                for image_i, image in enumerate(images):
+                    if image_i == 0:
+                        image_input_caption += f'Input image {image_i+1}: "{self.captioning_fn([image])[0]}"'
+                    else:
+                        image_input_caption += f'input image {image_i+1}: "{self.captioning_fn([image])[0]}"'
+                    if len(images) > 1:
+                        image_input_caption += ", "
+                # Update intent to include captions of input images.
+                intent = f"{image_input_caption}\nIntent: {intent}"
+            elif not self.multimodal_inputs:
+                print(
+                    "WARNING: Input image provided but no image captioner available."
+                )
+
+        if self.multimodal_inputs:
+            prompt = self.prompt_constructor.construct(
+                trajectory, intent, page_screenshot_img, images, meta_data
+            )
+        else:
+            prompt = self.prompt_constructor.construct(
+                trajectory, intent, meta_data
+            )
+        lm_config = self.lm_config
+        n = 0
+        while True:
+            responses = call_llm(lm_config, prompt, num_outputs=max(branching_factor * 2, 20))
+            if output_response:
+                print(f'Agent: {responses}', flush=True)
+            if type(responses) == str:
+                responses = [responses]
+            force_prefix = self.prompt_constructor.instruction[
+                "meta_data"
+            ].get("force_prefix", "")
+            n += 1
+            all_actions = {}
+            parsed_actions_count = {}
+
+            for response in responses:
+                response = f"{force_prefix}{response}"
+                try:
+                    parsed_response = self.prompt_constructor.extract_action(
+                        response
+                    )
+                    if parsed_response in all_actions:
+                        parsed_actions_count[parsed_response] += 1
+                    else:
+                        if self.action_set_tag == "id_accessibility_tree":
+                            action = create_id_based_action(parsed_response)
+                        elif self.action_set_tag == "playwright":
+                            action = create_playwright_action(parsed_response)
+                        elif self.action_set_tag == "som":
+                            action = create_id_based_action(parsed_response)
+                        else:
+                            raise ValueError(
+                                f"Unknown action type {self.action_set_tag}"
+                            )
+                        parsed_actions_count[parsed_response] = 1
+                        action["raw_prediction"] = response
+                        all_actions[parsed_response] = action
+                except ActionParsingError as e:
+                    continue
+            
+            # If any valid action is found, break.
+            if len(all_actions) > 0:
+                break
+            else:
+                # If no valid action is found, retry.
+                # If the number of retries exceeds the maximum, return a None action.
+                if n >= lm_config.gen_config["max_retry"]:
+                    action = create_none_action()
+                    action["raw_prediction"] = response
+                    return [action]
+                
+        # Find top branching_factor actions.
+        top_actions = sorted(parsed_actions_count, key=parsed_actions_count.get, reverse=True)[:branching_factor]
+        top_action_count = sum([parsed_actions_count[action] for action in top_actions])
+        updated_actions = []
+        for action in top_actions:
+            a = all_actions[action]
+            a['prob'] = parsed_actions_count[action] / top_action_count
+            updated_actions.append(a)
+
+        return updated_actions
+
+    def reset(self, test_config_file: str) -> None:
+        pass
+
+
 def construct_agent(args: argparse.Namespace, captioning_fn=None) -> Agent:
     llm_config = lm_config.construct_llm_config(args)
 
@@ -215,6 +348,19 @@ def construct_agent(args: argparse.Namespace, captioning_fn=None) -> Agent:
             args.instruction_path, lm_config=llm_config, tokenizer=tokenizer
         )
         agent = PromptAgent(
+            action_set_tag=args.action_set_tag,
+            lm_config=llm_config,
+            prompt_constructor=prompt_constructor,
+            captioning_fn=captioning_fn
+        )
+    elif args.agent_type == "search":
+        with open(args.instruction_path) as f:
+            constructor_type = json.load(f)["meta_data"]["prompt_constructor"]
+        tokenizer = Tokenizer(args.provider, args.model)
+        prompt_constructor = eval(constructor_type)(
+            args.instruction_path, lm_config=llm_config, tokenizer=tokenizer
+        )
+        agent = SearchAgent(
             action_set_tag=args.action_set_tag,
             lm_config=llm_config,
             prompt_constructor=prompt_constructor,

@@ -6,15 +6,25 @@ import logging
 import os
 import random
 import time
-from typing import Any
+from typing import Any, Union
 
 import aiolimiter
 import openai
 from openai import AsyncOpenAI, OpenAI
-
-client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-aclient = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
 from tqdm.asyncio import tqdm_asyncio
+
+if "OPENAI_API_BASE" not in os.environ:
+    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    aclient = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
+else:
+    # Used for running vllm models.
+    print("WARNING: Using OPENAI_API_KEY=EMPTY")
+    client = OpenAI(
+        api_key="EMPTY", base_url=os.environ["OPENAI_API_BASE"]
+    )
+    aclient = AsyncOpenAI(
+        api_key="EMPTY", base_url=os.environ["OPENAI_API_BASE"]
+    )
 
 
 def retry_with_exponential_backoff(  # type: ignore
@@ -249,19 +259,28 @@ def generate_from_openai_chat_completion(
     top_p: float,
     context_length: int,
     stop_token: str | None = None,
-) -> str:
+    num_outputs: int = 1,
+) -> Union[str, list[str]]:
     if "OPENAI_API_KEY" not in os.environ:
         raise ValueError(
             "OPENAI_API_KEY environment variable must be set when using OpenAI API."
         )
+    if "OPENAI_API_BASE" in os.environ:
+        assert "llama" in model.lower()
+
     response = client.chat.completions.create(
         model=model,
         messages=messages,
         temperature=temperature,
         max_tokens=max_tokens,
         top_p=top_p,
+        n=num_outputs
     )
-    answer: str = response.choices[0].message.content
+    if num_outputs > 1:
+        answer: list[str] = [x.message.content for x in response.choices]
+    else:
+        answer: str = response.choices[0].message.content
+
     return answer
 
 

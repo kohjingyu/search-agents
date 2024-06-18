@@ -3,7 +3,10 @@
 Modified from https://github.com/web-arena-x/webarena/blob/main/run.py.
 """
 import argparse
+import collections
+import copy
 import glob
+import heapq
 import json
 import logging
 import os
@@ -22,6 +25,7 @@ from PIL import Image
 from agent import (
     PromptAgent,
     construct_agent,
+    value_function
 )
 from agent.prompts import *
 from browser_env import (
@@ -32,7 +36,7 @@ from browser_env import (
     Trajectory,
     create_stop_action,
 )
-from browser_env.actions import is_equivalent
+from browser_env.actions import is_equivalent, create_goto_url_action
 from browser_env.auto_login import get_site_comb_from_filepath
 from browser_env.helper_functions import (
     RenderHelper,
@@ -105,7 +109,7 @@ def config() -> argparse.Namespace:
     parser.add_argument("--max_steps", type=int, default=30)
 
     # agent config
-    parser.add_argument("--agent_type", type=str, default="prompt")
+    parser.add_argument("--agent_type", type=str, default="prompt", choices=["prompt", "search"])
     parser.add_argument(
         "--instruction_path",
         type=str,
@@ -170,7 +174,15 @@ def config() -> argparse.Namespace:
         default=3840,
     )
 
+    # search config
+    parser.add_argument("--max_depth", type=int, default=4, help="Max depth for search agents.")
+    parser.add_argument("--branching_factor", type=int, default=5, help="Branching factor at each step for the search agent.")
+    parser.add_argument("--search_algo", type=str, default="vf", help="Search algorithm to use", choices=["vf", "bfs", "dfs"])
+    parser.add_argument("--vf_budget", type=int, default=20, help="Budget for the number of value function evaluations.")
+    parser.add_argument("--value_function", type=str, default="gpt4o", help="What value function to use.", choices=["gpt4o"])
+
     # example config
+    parser.add_argument("--test_idx", type=str, default=None, help="Idx to test")
     parser.add_argument("--test_start_idx", type=int, default=0)
     parser.add_argument("--test_end_idx", type=int, default=910)
 
@@ -257,6 +269,8 @@ def test(
 ) -> None:
     scores = []
     max_steps = args.max_steps
+    branching_factor = args.branching_factor
+    assert args.vf_budget is not None, "Value function budget should be specified."
 
     early_stop_thresholds = {
         "parsing_failure": args.parsing_failure_th,
@@ -375,12 +389,15 @@ def test(
 
             agent.reset(config_file)
             trajectory: Trajectory = []
+            action_history = []  # Save the action history for the agent so that we can backtrack.
             obs, info = env.reset(options={"config_file": config_file})
-            state_info: StateInfo = {"observation": obs, "info": info}
+            state_info: StateInfo = {"observation": obs, "info": info, "url": env.page.url}
             trajectory.append(state_info)
 
             meta_data = {"action_history": ["None"]}
+            step_idx = 0
             while True:
+                step_idx += 1
                 early_stop_flag, stop_info = early_stop(
                     trajectory, max_steps, early_stop_thresholds
                 )
@@ -394,37 +411,233 @@ def test(
                             intent,
                             images=images,
                             meta_data=meta_data,
+                            branching_factor=branching_factor
                         )
                     except ValueError as e:
                         # get the error message
                         action = create_stop_action(f"ERROR: {str(e)}")
+                
+                # BEGIN SEARCH
+                if args.agent_type == "search" and type(action) == list:
+                    evaluator = evaluator_router(
+                        config_file, captioning_fn=eval_caption_image_fn
+                    )
+                    best_score, best_actions = None, []
+                    all_candidates = []
+                    all_inputs = []  # For input to the value function computation.
 
-                trajectory.append(action)
+                    def take_action_and_score(a, curr_trajectory, curr_action_history,
+                                              curr_obs_metadata, last_screenshots: list[Image.Image], 
+                                              generate_next_actions: bool = True, depth: int = 0,
+                                              branching_factor: int = 5, a_idx: int = -1, curr_a_idx: int = -1):
+                        """Take the given actions and score the resulting trajectory."""
+                        temp_trajectory = copy.deepcopy(curr_trajectory)
+                        temp_action_history = copy.deepcopy(curr_action_history)
+                        should_generate_next_actions = generate_next_actions
+                        img_after_path = f"{task_id}_step{step_idx}_action{a_idx}_depth{depth}_curra{curr_a_idx}_after.png"
+                        obs, _, terminated, _, info = env.step(a)
+                        # Save the image after the action.
+                        obs_img = Image.fromarray(obs["image"])
+                        all_inputs.append({
+                            "text": obs["text"],
+                            "image": obs["image"],
+                            "image_after_path": img_after_path,
+                            "action": a["raw_prediction"],
+                        })
+                        temp_trajectory.append(a)
 
-                action_str = get_action_description(
-                    action,
-                    state_info["info"]["observation_metadata"],
-                    action_set_tag=args.action_set_tag,
-                    prompt_constructor=agent.prompt_constructor
-                    if isinstance(agent, PromptAgent)
-                    else None,
-                )
-                render_helper.render(
-                    action, state_info, meta_data, args.render_screenshot
-                )
-                meta_data["action_history"].append(action_str)
+                        # Get natural language description of current action
+                        curr_action_str = get_action_description(
+                            a, curr_obs_metadata, action_set_tag=args.action_set_tag,
+                            prompt_constructor=agent.prompt_constructor if isinstance(agent, PromptAgent) else None,
+                        )
+                        temp_action_history.append(curr_action_str)
 
-                if action["action_type"] == ActionTypes.STOP:
+                        if a["action_type"] == ActionTypes.STOP:
+                            should_generate_next_actions = False
+                        elif a["action_type"] != ActionTypes.STOP:
+                            temp_trajectory.append({"observation": obs, "info": info, "url": env.page.url})
+                        elif terminated:
+                            should_generate_next_actions = False
+                            temp_trajectory.append(create_stop_action(""))
+                        
+                        start_time = time.time()
+                        # Only evaluate terminating trajectories
+                        try:
+                            if args.value_function in ["gpt4o"]:
+                                score = value_function.evaluate_success(
+                                    screenshots=last_screenshots[-(args.max_depth+1):] + [obs_img], actions=temp_action_history,
+                                    current_url=env.page.url, last_reasoning=a["raw_prediction"],
+                                    intent=intent, models=["gpt-4o-2024-05-13"],
+                                    intent_images=images if len(images) > 0 else None)
+                            else:
+                                raise NotImplementedError(f"Value function {args.value_function} not implemented")
+                        except Exception as e:
+                            print(f"Error in evaluator: {e}")
+                            score = 0
+
+                        next_actions = []
+                        if score < 1 and should_generate_next_actions:
+                            start_time = time.time()
+                            temp_early_stop_flag, _ = early_stop(
+                                temp_trajectory, max_steps, early_stop_thresholds
+                            )
+                            if not temp_early_stop_flag:
+                                try:
+                                    # Generate possible action candidates for next step.
+                                    next_actions = agent.next_action(
+                                        temp_trajectory,
+                                        intent,
+                                        images=images,
+                                        meta_data=meta_data,
+                                        branching_factor=branching_factor
+                                    )
+                                except ValueError as e:
+                                    # get the error message
+                                    print('Failed to generate next actions:', e)
+
+                        return score, temp_trajectory, temp_action_history, next_actions
+                    
+                    def maybe_update_best_action(score, actions):
+                        nonlocal best_score, best_actions
+                        # The second if statement checks that for scores < 1 that are tied, we should take the one that doesn't terminate.
+                        if (best_score is None) or (score > best_score):
+                            best_score, best_actions = score, actions
+                    
+                    max_depth = args.max_depth  # Lookahead of trajectories of length (max_depth + 1)
+                    action_queue = []  # Store tuple of (score, a_idx, action, trajectory, depth, ...)
+                    actions_at_depth = collections.defaultdict(int)
+                    search_counter = 0
+                    for a_idx, a in enumerate(action):
+                        # Default the score of the initial actions to 0.5.
+                        item = (-0.5, a_idx, -1, search_counter, [a], copy.deepcopy(trajectory), copy.deepcopy(meta_data["action_history"]), 0)
+                        if args.search_algo == "bfs":
+                            action_queue.append(item)
+                        elif args.search_algo == "dfs":
+                            action_queue.append(item)
+                        elif args.search_algo == "vf":
+                            heapq.heappush(action_queue, item)
+                    
+                    while action_queue and search_counter < args.vf_budget:
+                        if args.search_algo == "bfs":
+                            item = action_queue.pop(0)
+                        elif args.search_algo == "dfs":
+                            item = action_queue.pop(-1)
+                        elif args.search_algo == "vf":
+                            item = heapq.heappop(action_queue)
+                        curr_score, a_idx, curr_a_idx, _, curr_actions, curr_trajectory, curr_action_history, curr_depth = item
+
+                        search_counter += 1
+                        next_action = curr_actions[-1]
+                        actions_at_depth[curr_depth] += 1
+                        assert len(curr_actions) == curr_depth + 1, f"(depth+1) should be equal to the number of actions taken, but got {len(curr_actions)} and {curr_depth+1}"
+
+                        if next_action["action_type"] == ActionTypes.NONE:
+                            maybe_update_best_action(0, curr_actions)
+                        else:
+                            last_screenshots = []
+                            # Reset environment to prepare for next action.
+                            _ = env.reset(options={"config_file": config_file})
+                            # Take all the previous actions to get back to the current state.
+                            start_time = time.time()
+                            for a_hist in action_history:
+                                obs, _, _, _, info = env.step(a_hist)
+                            last_screenshots.append(Image.fromarray(obs["image"]))
+                            # Take all previous actions in the current trajectory.
+                            start_time = time.time()
+                            for a in curr_actions[:-1]:
+                                obs, _, _, _, info = env.step(a)
+                                last_screenshots.append(Image.fromarray(obs["image"]))  # 1e-5s
+                            
+                            # Take the next action to evaluate.
+                            start_time = time.time()
+                            score, new_trajectory, new_action_history, next_actions = take_action_and_score(
+                                next_action, curr_trajectory, curr_action_history,
+                                copy.deepcopy(info["observation_metadata"]), last_screenshots=last_screenshots[-4:],
+                                generate_next_actions=(curr_depth < max_depth),
+                                depth=curr_depth, branching_factor=branching_factor, a_idx=a_idx, curr_a_idx=curr_a_idx)
+                            raw_pred = next_action['raw_prediction'].split('\n')[-1]
+                            all_candidates.append(f'a_idx={a_idx},curr_a_idx={curr_a_idx},depth={curr_depth}: {next_action["raw_prediction"]} (score: {score}, time: {time.time() - start_time})')
+                            maybe_update_best_action(score, curr_actions)
+                            # Try for next action (if allowed)
+                            if score == 1:
+                                break
+                            else:
+                                # Add next actions to the queue.
+                                for na_idx, na in enumerate(next_actions):
+                                    item = (-score, a_idx, na_idx, search_counter, curr_actions + [na], copy.deepcopy(new_trajectory),copy.deepcopy(new_action_history), curr_depth + 1)
+                                    if args.search_algo == "vf":
+                                        heapq.heappush(action_queue, item)
+                                    else:
+                                        action_queue.append(item)
+                else:
+                    all_candidates = []
+                    best_actions = [action]
+                    best_score = None
+
+                stop_trajectory = False
+                if args.agent_type == "search":
+                    # Reset environment to the actual current state to prepare for taking the best action.
+                    _ = env.reset(options={"config_file": config_file})
+                    prev_url = env.page.url
+                    truncated_action_history = []
+                    for a_hist in action_history:
+                        _ = env.step(a_hist)
+                        curr_url = env.page.url
+                        # Optimization to simplify the action history, since we will commit the best action.
+                        truncated_action_history.append(a_hist)
+                        if curr_url != prev_url:
+                            # URL has changed, update the truncated_action_history
+                            truncated_action_history = [create_goto_url_action(curr_url)]
+                            prev_url = curr_url
+                    action_history = truncated_action_history
+
+                prev_url = env.page.url
+                # Now we can actually execute the best action.
+                for best_idx, action in enumerate(best_actions):
+                    all_candidates.append(f"Selected action {best_idx}: {action['raw_prediction']}")
+                    trajectory.append(action)
+
+                    action_str = get_action_description(
+                        action,
+                        state_info["info"]["observation_metadata"],
+                        action_set_tag=args.action_set_tag,
+                        prompt_constructor=agent.prompt_constructor
+                        if isinstance(agent, PromptAgent)
+                        else None,
+                    )
+                    render_helper.render(
+                        action, state_info, meta_data, args.render_screenshot, all_candidates if args.agent_type == "search" else None
+                    )
+
+                    meta_data["action_history"].append(action_str)
+
+                    if action["action_type"] == ActionTypes.STOP:
+                        stop_trajectory = True
+                        break
+
+                    obs, _, terminated, _, info = env.step(action)
+                    # Save the committed action to the action history.
+                    action_history.append(action)
+                    curr_url = env.page.url
+                    if curr_url != prev_url:
+                        # URL has changed, simplify the action_history so that we resume from this checkpoint
+                        action_history = [create_goto_url_action(curr_url)]
+                        prev_url = curr_url
+                    state_info = {"observation": obs, "info": info, "url": env.page.url}
+                    trajectory.append(state_info)
+
+                    if terminated:
+                        # add a action place holder
+                        trajectory.append(create_stop_action(""))
+                        stop_trajectory = True
+                        break
+
+                # We solved the task and can quit.
+                if stop_trajectory or (best_score is not None and best_score == 1.0):
+                    # Save obs
                     break
-
-                obs, _, terminated, _, info = env.step(action)
-                state_info = {"observation": obs, "info": info}
-                trajectory.append(state_info)
-
-                if terminated:
-                    # add a action place holder
-                    trajectory.append(create_stop_action(""))
-                    break
+            # END SEARCH
 
             # NOTE: eval_caption_image_fn is used for running eval_vqa functions.
             evaluator = evaluator_router(
@@ -522,10 +735,16 @@ if __name__ == "__main__":
     test_config_base_dir = args.test_config_base_dir
 
     test_file_list = []
-    st_idx = args.test_start_idx
-    ed_idx = args.test_end_idx
-    for i in range(st_idx, ed_idx):
-        test_file_list.append(os.path.join(test_config_base_dir, f"{i}.json"))
+    if args.test_idx is not None:
+        print(f"Testing on {args.test_idx}")
+        for x in args.test_idx.split(","):
+            test_file_list.append(os.path.join(test_config_base_dir, f"{x}.json"))
+    else:
+        print(f"Testing on {args.test_start_idx} to {args.test_end_idx}")
+        st_idx = args.test_start_idx
+        ed_idx = args.test_end_idx
+        for i in range(st_idx, ed_idx):
+            test_file_list.append(os.path.join(test_config_base_dir, f"{i}.json"))
     test_file_list = get_unfinished(test_file_list, args.result_dir)
     print(f"Total {len(test_file_list)} tasks left")
     args.render = False

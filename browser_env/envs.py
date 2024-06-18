@@ -1,5 +1,4 @@
 import json
-import os
 import re
 import subprocess
 import time
@@ -11,7 +10,6 @@ from typing import Any, Union
 import numpy as np
 import numpy.typing as npt
 import requests
-from beartype import beartype
 from gymnasium import Env
 from gymnasium.spaces import Box, Text
 from playwright.sync_api import (
@@ -23,12 +21,11 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
-DATASET = os.environ["DATASET"]
-if DATASET == "visualwebarena":
-    from browser_env.env_config import (
-        CLASSIFIEDS,
-        CLASSIFIEDS_RESET_TOKEN,
-    )
+from browser_env.env_config import (
+    CLASSIFIEDS,
+    CLASSIFIEDS_RESET_TOKEN,
+    REDDIT_RESET_URL,
+)
 
 from .actions import Action, execute_action, get_action_space
 from .processors import ObservationHandler, ObservationMetadata
@@ -82,7 +79,6 @@ class ScriptBrowserEnv(Env[dict[str, Observation], Action]):
     and observation space is the html content of the page.
     """
 
-    @beartype
     def __init__(
         self,
         max_page_length: int = 8192,
@@ -136,7 +132,6 @@ class ScriptBrowserEnv(Env[dict[str, Observation], Action]):
             self.observation_handler.get_observation_space()
         )
 
-    @beartype
     def setup(self, config_file: Path | None = None) -> None:
         self.context_manager = sync_playwright()
         self.playwright = self.context_manager.__enter__()
@@ -152,26 +147,26 @@ class ScriptBrowserEnv(Env[dict[str, Observation], Action]):
 
         # Reset site if needed. Currently only supported for Classifieds.
         # TODO(jykoh): Add reset functionality for Shopping/Reddit.
-        if instance_config.get("require_reset", False):
-            if "classifieds" in instance_config["sites"]:
-                # Send POST request to __CLASSIFIEDS__/index.php?page=reset with token=CLASSIFIEDS_TOKEN
-                response = requests.post(
-                    f"{CLASSIFIEDS}/index.php?page=reset",
-                    data={"token": CLASSIFIEDS_RESET_TOKEN},
-                )
+        # if instance_config.get("require_reset", False):
+        #     if "classifieds" in instance_config["sites"]:
+        #         # Send POST request to __CLASSIFIEDS__/index.php?page=reset with token=CLASSIFIEDS_TOKEN
+        #         response = requests.post(
+        #             f"{CLASSIFIEDS}/index.php?page=reset",
+        #             data={"token": CLASSIFIEDS_RESET_TOKEN},
+        #         )
 
-                # Check if the request was successful
-                if response.status_code == 200:
-                    print("Reset Classifieds site.")
-                else:
-                    print(
-                        "Failed to reset Classifieds site:",
-                        response.status_code,
-                    )
-            else:
-                print(
-                    "WARNING: Reset is not supported for this site. Please manually reset the site."
-                )
+        #         # Check if the request was successful
+        #         if response.status_code == 200:
+        #             print("Reset Classifieds site.")
+        #         else:
+        #             print(
+        #                 "Failed to reset Classifieds site:",
+        #                 response.status_code,
+        #             )
+        #     else:
+        #         print(
+        #             "WARNING: Reset is not supported for this site. Please manually reset the site."
+        #         )
 
         storage_state = instance_config.get("storage_state", None)
         start_url = instance_config.get("start_url", None)
@@ -190,41 +185,46 @@ class ScriptBrowserEnv(Env[dict[str, Observation], Action]):
         )
         if self.save_trace_enabled:
             self.context.tracing.start(screenshots=True, snapshots=True)
-
         if start_url:
             start_urls = start_url.split(" |AND| ")
             for url in start_urls:
                 page = self.context.new_page()
+                client = page.context.new_cdp_session(
+                    page
+                )  # talk to chrome devtools
                 if self.text_observation_type in [
                     "accessibility_tree",
                     "accessibility_tree_with_captioner",
                 ]:
-                    client = page.context.new_cdp_session(page)
                     client.send("Accessibility.enable")
-                    client.detach()
+                page.client = client  # type: ignore
                 page.goto(url)
             # set the first page as the current page
             self.page = self.context.pages[0]
             self.page.bring_to_front()
         else:
             self.page = self.context.new_page()
+            client = self.page.context.new_cdp_session(self.page)
             if self.text_observation_type in [
                 "accessibility_tree",
                 "accessibility_tree_with_captioner",
             ]:
-                client = self.page.context.new_cdp_session(self.page)
                 client.send("Accessibility.enable")
-                client.detach()
+            self.page.client = client  # type: ignore
+
+    def get_page_client(self, page: Page) -> CDPSession:
+        return page.client  # type: ignore
 
     def _get_obs(self) -> dict[str, Observation]:
-        obs = self.observation_handler.get_observation(self.page)
+        obs = self.observation_handler.get_observation(
+            self.page, self.get_page_client(self.page)
+        )
         return obs
 
     def _get_obs_metadata(self) -> dict[str, ObservationMetadata]:
         metadata = self.observation_handler.get_observation_metadata()
         return metadata
 
-    @beartype
     def reset(
         self,
         *,
@@ -250,7 +250,8 @@ class ScriptBrowserEnv(Env[dict[str, Observation], Action]):
             self.setup()
         self.reset_finished = True
 
-        self.page.wait_for_timeout(int(self.sleep_after_execution * 1000))
+        if self.sleep_after_execution > 0:
+            time.sleep(self.sleep_after_execution)
 
         observation = self._get_obs()
         observation_metadata = self._get_obs_metadata()
@@ -269,6 +270,10 @@ class ScriptBrowserEnv(Env[dict[str, Observation], Action]):
     def close(self) -> None:
         if self.reset_finished:
             self.context_manager.__exit__()
+        # # Save url2captions
+        # with open("url2captions_blip2.json", "w") as wf:
+        #     json.dump(self.observation_handler.text_processor.url2caption, wf)
+        #     print(f"Saving url2captions_blip2.json with {len(self.observation_handler.text_processor.url2caption)} entries")
 
     def step(
         self, action: Action
@@ -284,15 +289,21 @@ class ScriptBrowserEnv(Env[dict[str, Observation], Action]):
                 self.page,
                 self.context,
                 self.observation_handler.action_processor,
-                self.sleep_after_execution,
             )
             success = True
         except Exception as e:
             fail_error = str(e)
 
+        # hard sleep TODO[shuyanzh] suboptimal, may need to check network
+        if self.sleep_after_execution > 0:
+            time.sleep(self.sleep_after_execution)
+
+        start_time = time.time()
         observation = self._get_obs()
+        print("[env.step()] get_obs() time taken", time.time() - start_time)
         observation_metadata = self._get_obs_metadata()
 
+        start_time = time.time()
         info = {
             "page": DetachedPage(self.page.url, self.page.content()),
             "fail_error": fail_error,
@@ -305,4 +316,5 @@ class ScriptBrowserEnv(Env[dict[str, Observation], Action]):
             False,  # truncated
             info,
         )
+        # print("[env.step()] info/msg time taken", time.time() - start_time)
         return msg

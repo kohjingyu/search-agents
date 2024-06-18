@@ -11,7 +11,6 @@ from urllib.parse import urljoin
 
 import evaluate  # type: ignore[import]
 import requests
-from beartype import beartype
 from beartype.door import is_bearable
 from nltk.tokenize import word_tokenize  # type: ignore
 from PIL import Image
@@ -46,8 +45,6 @@ from evaluation_harness.helper_functions import (
 
 Trajectory = list[Union[Action, StateInfo]]
 
-
-@beartype
 class Evaluator(object):
     def __init__(self, eval_tag: str = "") -> None:
         self.eval_tag = eval_tag
@@ -84,13 +81,10 @@ class Evaluator(object):
 
         return last_state  # type: ignore[return-value]
 
-
-@beartype
 class NumericEvaluator(Evaluator):
     """Check if the numerical relationship is correct"""
 
     @staticmethod
-    @beartype
     def str_2_int(s: str) -> Optional[int]:
         try:
             s = s.strip()
@@ -104,7 +98,6 @@ class NumericEvaluator(Evaluator):
             return None
 
     @staticmethod
-    @beartype
     def compare_inequality(
         value: Union[int, float], inequality: str, tol: float = 1e-8
     ) -> bool:
@@ -135,8 +128,6 @@ class NumericEvaluator(Evaluator):
 
         raise ValueError(f"Invalid inequality string: {inequality}")
 
-
-@beartype
 class StringEvaluator(Evaluator):
     """Check whether the answer is correct with:
     exact match: the answer is exactly the same as the reference answer
@@ -145,7 +136,6 @@ class StringEvaluator(Evaluator):
     """
 
     @staticmethod
-    @beartype
     def clean_answer(answer: str) -> str:
         if answer.startswith("'") and answer.endswith("'"):
             answer = answer[1:-1]
@@ -154,7 +144,6 @@ class StringEvaluator(Evaluator):
         return answer.lower()
 
     @staticmethod
-    @beartype
     def exact_match(ref: str, pred: Union[str, int]) -> float:
         if isinstance(pred, int):
             pred = str(pred)
@@ -164,20 +153,22 @@ class StringEvaluator(Evaluator):
         )
 
     @staticmethod
-    @beartype
-    def must_include(ref: str, pred: str) -> float:
+    def must_include(ref: str, pred: str, tokenize: bool = False) -> float:
         clean_ref = StringEvaluator.clean_answer(ref)
         clean_pred = StringEvaluator.clean_answer(pred)
         # tokenize the answer if the ref is a single word
         # prevent false positive (e.g, 0)
-        if len(word_tokenize(clean_ref)) == 1:
+        if (
+            tokenize
+            and len(clean_ref) == 1
+            and len(word_tokenize(clean_ref)) == 1
+        ):
             tok_pred = word_tokenize(clean_pred)
             return float(clean_ref in tok_pred)
         else:
             return float(clean_ref in clean_pred)
 
     @staticmethod
-    @beartype
     def must_exclude(ref: str, pred: str) -> float:
         """Returns 1 if pred is not in ref, and 0 otherwise"""
         clean_ref = StringEvaluator.clean_answer(ref)
@@ -191,12 +182,10 @@ class StringEvaluator(Evaluator):
             return float(clean_ref not in clean_pred)
 
     @staticmethod
-    @beartype
     def fuzzy_match(ref: str, pred: str, intent: str) -> float:
         return llm_fuzzy_match(pred, ref, intent)
 
     @staticmethod
-    @beartype
     def ua_match(ref: str, pred: str, intent: str) -> float:
         return llm_ua_match(pred, ref, intent)
 
@@ -238,7 +227,7 @@ class StringEvaluator(Evaluator):
                     assert isinstance(value, list)
                     for must_value in value:
                         value_or = must_value.split(" |OR| ")
-                        score *= any([self.must_include(ref=v, pred=pred) for v in value_or])
+                        score *= any([self.must_include(ref=v, pred=pred, tokenize=(len(value) == 1)) for v in value_or])
                 case "must_exclude":
                     assert isinstance(value, list)
                     for must_excl_value in value:
@@ -276,8 +265,6 @@ class StringEvaluator(Evaluator):
                             )
         return score
 
-
-@beartype
 class StringSoftEvaluator(Evaluator):
     """Use text generation metrics such as BLEU, ROUGE, etc. to evaluate the answer"""
 
@@ -298,8 +285,6 @@ class StringSoftEvaluator(Evaluator):
         rouge = m.compute(predictions=[pred], references=[ref])
         return float(rouge["rouge1"])
 
-
-@beartype
 class URLExactEvaluator(Evaluator):
     """Check whether the URL is exactly the same as of the reference URLs"""
 
@@ -337,8 +322,6 @@ class URLExactEvaluator(Evaluator):
         else:
             raise ValueError(f"Unknown matching rule: {matching_rule}")
 
-
-@beartype
 class HTMLContentExactEvaluator(Evaluator):
     """Check whether the contents appear in the page"""
 
@@ -423,7 +406,7 @@ class HTMLContentExactEvaluator(Evaluator):
                     score *= any(
                         [
                             StringEvaluator.must_include(
-                                ref=content, pred=selected_element
+                                ref=content, pred=selected_element, tokenize=False
                             )
                             for content in content_or
                         ]
@@ -479,8 +462,6 @@ class HTMLContentExactEvaluator(Evaluator):
 
         return score
 
-
-@beartype
 class PageImageEvaluator(Evaluator):
     """Check whether the answer is correct by querying a vision model."""
 
@@ -622,8 +603,6 @@ class EvaluatorComb:
 
         return score
 
-
-@beartype
 def evaluator_router(
     config_file: Path | str, captioning_fn=None
 ) -> EvaluatorComb:

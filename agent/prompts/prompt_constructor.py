@@ -343,7 +343,7 @@ class MultimodalCoTPromptConstructor(CoTPromptConstructor):
                     example_img = Image.open(z)
                     message.append(
                         {
-                            "role": "system",
+                            "role": "user" if "gpt-4o" in self.lm_config.model else "system",
                             "name": "example_user",
                             "content": [
                                 {"type": "text", "text": x},
@@ -362,7 +362,7 @@ class MultimodalCoTPromptConstructor(CoTPromptConstructor):
                     )
                     message.append(
                         {
-                            "role": "system",
+                            "role": "user" if "gpt-4o" in self.lm_config.model else "system",
                             "name": "example_assistant",
                             "content": [{"type": "text", "text": y}],
                         }
