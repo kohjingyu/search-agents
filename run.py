@@ -335,11 +335,10 @@ def test(
     )
 
     for config_file in config_file_list:
-        try:
-            render_helper = RenderHelper(
+        render_helper = RenderHelper(
                 config_file, args.result_dir, args.action_set_tag
             )
-
+        try:
             # Load task.
             with open(config_file) as f:
                 _c = json.load(f)
