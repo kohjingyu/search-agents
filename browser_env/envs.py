@@ -147,8 +147,8 @@ class ScriptBrowserEnv(Env[dict[str, Observation], Action]):
         else:
             instance_config = {}
 
-        # Reset site if needed. Currently only supported for Classifieds.
-        # TODO(jykoh): Add reset functionality for Shopping/Reddit.
+        # NOTE(jykoh): We comment this out as it takes too much time to reset for search.
+        # # Reset site if needed. Currently only supported for Classifieds.
         # if instance_config.get("require_reset", False):
         #     if "classifieds" in instance_config["sites"]:
         #         # Send POST request to __CLASSIFIEDS__/index.php?page=reset with token=CLASSIFIEDS_TOKEN
