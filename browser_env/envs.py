@@ -21,11 +21,13 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
-from browser_env.env_config import (
-    CLASSIFIEDS,
-    CLASSIFIEDS_RESET_TOKEN,
-    REDDIT_RESET_URL,
-)
+import os
+DATASET = os.environ["DATASET"]
+if DATASET == "visualwebarena":
+    from browser_env.env_config import (
+        CLASSIFIEDS,
+        CLASSIFIEDS_RESET_TOKEN,
+    )
 
 from .actions import Action, execute_action, get_action_space
 from .processors import ObservationHandler, ObservationMetadata
