@@ -1,7 +1,7 @@
 # Tree Search for Language Model Agents
 
 [<a href="https://jykoh.com/search-agents">Website</a>] 
-[<a href="https://jykoh.com/search-agents/paper.pdf">Paper</a>] 
+[<a href="http://arxiv.org/abs/2407.01476">Paper</a>] 
 
 ![Overview](media/search_overview.gif)
 
@@ -90,7 +90,7 @@ If you methods or code useful, please consider citing our paper:
 @article{koh2024tree,
   title={Tree Search for Language Model Agents},
   author={Koh, Jing Yu and McAleer, Stephen and Fried, Daniel and Salakhutdinov, Ruslan},
-  journal={Preprint},
+  journal={arXiv preprint arXiv:2407.01476},
   year={2024}
 }
 ```
