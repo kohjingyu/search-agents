@@ -11,6 +11,7 @@ We propose an inference-time tree search algorithm to enable language model agen
 - [ ] Add other options besides gpt-4o for the value function
 
 ## News
+- [07/24/2024]: Released [trajectories](#agent-trajectories) of the gpt-4o agent.
 - [06/19/2024]: GitHub repo released.
 
 ## Install
@@ -83,6 +84,10 @@ By default, the scripts run experiments with the agents with search. If you wish
 
 If you wish to run the Llama-3 models we have in our paper, first set up a [vLLM OpenAI compatible server](https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html). Then, update the `OPENAI_BASE_URL` environment variable in `scripts/run_llama_vwa_shopping_search.sh` to reflect the URL that the vLLM server is running on. This particular script shows how to run the Llama-3 agent on the VWA shopping environment; it is otherwise very similar to the OpenAI scripts for running on the other environments.
 
+
+## Agent Trajectories
+
+We release the agent trajectories and results of the gpt-4o agent (with gpt-4o as the reward function) [here](https://drive.google.com/file/d/127GqJ19qxpAcWlUKXlr5zBeAIW5Pi_0H/view). They are saved in the same format specified in [run.py](run.py).
 
 ## Citation
 If you methods or code useful, please consider citing our paper:
